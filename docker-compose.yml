@@ -2,6 +2,13 @@ services:
   check-cx:
     build:
       context: .
+      args:
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        http_proxy: ${http_proxy:-}
+        https_proxy: ${https_proxy:-}
+        NO_PROXY: ${NO_PROXY:-}
+        no_proxy: ${no_proxy:-}
     image: check-cx:local
     container_name: check-cx
     restart: unless-stopped

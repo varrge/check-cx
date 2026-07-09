@@ -2,6 +2,17 @@
 set -euo pipefail
 
 BRANCH="${1:-${DEPLOY_BRANCH:-localDev}}"
+PROXY="${DEPLOY_PROXY:-http://192.168.110.143:7890}"
+
+if [[ -n "$PROXY" && "$PROXY" != "off" ]]; then
+    export HTTP_PROXY="$PROXY"
+    export HTTPS_PROXY="$PROXY"
+    export http_proxy="$PROXY"
+    export https_proxy="$PROXY"
+    export NO_PROXY="${NO_PROXY:-localhost,127.0.0.1,::1}"
+    export no_proxy="$NO_PROXY"
+    echo "=== 使用代理 ${PROXY} ==="
+fi
 
 echo "=== 拉取 ${BRANCH} 分支 ==="
 git fetch origin "$BRANCH"
