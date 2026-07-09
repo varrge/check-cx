@@ -14,14 +14,11 @@ if [[ -n "$PROXY" && "$PROXY" != "off" ]]; then
     echo "=== 使用代理 ${PROXY} ==="
 fi
 
-echo "=== 拉取 ${BRANCH} 分支 ==="
+echo "=== 强制同步 origin/${BRANCH}（放弃本地代码改动） ==="
 git fetch origin "$BRANCH"
-if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
-    git checkout "$BRANCH"
-else
-    git checkout -B "$BRANCH" "origin/${BRANCH}"
-fi
-git pull --ff-only origin "$BRANCH"
+git checkout -f -B "$BRANCH" "origin/${BRANCH}"
+git reset --hard "origin/${BRANCH}"
+git clean -fd
 
 echo "=== 构建镜像 ==="
 docker compose build --pull
