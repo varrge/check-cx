@@ -112,7 +112,7 @@ pnpm lint   # 代码检查
 
 部署时，请将 `.env.local` 中的变量注入到目标平台，例如 Vercel、容器环境或自建服务器。
 
-Docker 部署默认拉取 `local` 分支并从当前代码构建镜像：
+Docker 部署默认拉取 `localDev` 分支并从当前代码构建镜像：
 
 ```bash
 ./deploy.sh

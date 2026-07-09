@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BRANCH="${1:-${DEPLOY_BRANCH:-local}}"
+BRANCH="${1:-${DEPLOY_BRANCH:-localDev}}"
 
 echo "=== 拉取 ${BRANCH} 分支 ==="
 git fetch origin "$BRANCH"
