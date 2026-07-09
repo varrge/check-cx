@@ -1,11 +1,19 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "=== 拉取最新代码 ==="
-git pull
+BRANCH="${1:-${DEPLOY_BRANCH:-local}}"
 
-echo "=== 拉取最新镜像 ==="
-docker compose pull
+echo "=== 拉取 ${BRANCH} 分支 ==="
+git fetch origin "$BRANCH"
+if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
+    git checkout "$BRANCH"
+else
+    git checkout -B "$BRANCH" "origin/${BRANCH}"
+fi
+git pull --ff-only origin "$BRANCH"
+
+echo "=== 构建镜像 ==="
+docker compose build --pull
 
 echo "=== 替换容器 ==="
 docker compose up -d --force-recreate --remove-orphans

@@ -1,0 +1,30 @@
+{
+  "schema": "public",
+  "providers": [
+    {
+      "name": "OpenAI",
+      "type": "openai",
+      "endpoint": "https://api.openai.com/v1/chat/completions",
+      "apiKeyEnv": "OPENAI_API_KEY",
+      "groupName": "OpenAI",
+      "include": ["^(gpt|o[0-9])"],
+      "exclude": ["embedding", "audio", "tts", "whisper", "moderation"]
+    },
+    {
+      "name": "Anthropic",
+      "type": "anthropic",
+      "endpoint": "https://api.anthropic.com/v1/messages",
+      "apiKeyEnv": "ANTHROPIC_API_KEY",
+      "groupName": "Anthropic",
+      "include": ["^claude"]
+    },
+    {
+      "name": "Gemini",
+      "type": "gemini",
+      "endpoint": "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+      "apiKeyEnv": "GEMINI_API_KEY",
+      "groupName": "Gemini",
+      "include": ["^gemini"]
+    }
+  ]
+}

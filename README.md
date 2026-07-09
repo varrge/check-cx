@@ -79,6 +79,20 @@ WHERE type = 'openai'
   AND model = 'gpt-4o-mini';
 ```
 
+也可以用脚本自动拉取供应商模型并写入监控配置：
+
+```bash
+cp monitor-providers.example.json monitor-providers.local.json
+pnpm models:sync -- --dry-run
+pnpm models:sync
+```
+
+本地开发 schema 使用：
+
+```bash
+pnpm models:sync -- --schema dev
+```
+
 ### 6. 启动开发服务器
 
 ```bash
@@ -97,6 +111,13 @@ pnpm lint   # 代码检查
 ```
 
 部署时，请将 `.env.local` 中的变量注入到目标平台，例如 Vercel、容器环境或自建服务器。
+
+Docker 部署默认拉取 `local` 分支并从当前代码构建镜像：
+
+```bash
+./deploy.sh
+./deploy.sh master  # 如需部署其他分支
+```
 
 ## 配置说明
 
