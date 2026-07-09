@@ -79,10 +79,9 @@ WHERE type = 'openai'
   AND model = 'gpt-4o-mini';
 ```
 
-也可以用脚本自动拉取供应商模型并写入监控配置：
+也可以运行引导式脚本，现场输入供应商信息并自动写入监控配置。API Key 输入时不会显示，也不会写入额外配置文件：
 
 ```bash
-cp monitor-providers.example.json monitor-providers.local.json
 pnpm models:sync -- --dry-run
 pnpm models:sync
 ```

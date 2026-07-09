@@ -1,17 +1,41 @@
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
+import { Writable } from "node:stream";
+import { createInterface } from "node:readline/promises";
 
-const DEFAULT_CONFIG = "monitor-providers.local.json";
+const PROVIDERS = {
+  openai: {
+    label: "OpenAI",
+    endpoint: "https://api.openai.com/v1/chat/completions",
+    apiKeyEnv: "OPENAI_API_KEY",
+    include: "^(gpt|o[0-9])",
+    exclude: "embedding,audio,tts,whisper,moderation",
+  },
+  anthropic: {
+    label: "Anthropic",
+    endpoint: "https://api.anthropic.com/v1/messages",
+    apiKeyEnv: "ANTHROPIC_API_KEY",
+    include: "^claude",
+    exclude: "",
+  },
+  gemini: {
+    label: "Gemini",
+    endpoint: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+    apiKeyEnv: "GEMINI_API_KEY",
+    include: "^gemini",
+    exclude: "embedding",
+  },
+};
+
 const API_PATH_SUFFIX_REGEX = /\/(chat\/completions|responses|messages)\/?$/;
 const GOOGLE_GENERATIVE_API_REGEX = /\/v\d+\w*\/models\/[^/:]+:(generateContent|streamGenerateContent)\/?$/;
 
 function parseArgs(argv) {
-  const args = { config: DEFAULT_CONFIG, dryRun: false };
-  for (let i = 0; i < argv.length; i += 1) {
-    const arg = argv[i];
+  const args = { dryRun: false };
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
     if (arg === "--dry-run") args.dryRun = true;
-    else if (arg === "--config") args.config = argv[++i];
-    else if (arg === "--schema") args.schema = argv[++i];
+    else if (arg === "--schema") args.schema = argv[++index];
     else if (arg === "--help") args.help = true;
     else throw new Error(`Unknown argument: ${arg}`);
   }
@@ -45,17 +69,37 @@ function loadEnv() {
   };
 }
 
-function loadConfig(path) {
-  if (!existsSync(path)) {
-    throw new Error(`Missing ${path}. Copy monitor-providers.example.json to ${DEFAULT_CONFIG} first.`);
-  }
-  return JSON.parse(readFileSync(path, "utf8"));
+async function ask(question, defaultValue = "") {
+  const readline = createInterface({ input: process.stdin, output: process.stdout });
+  const suffix = defaultValue ? ` [${defaultValue}]` : "";
+  const answer = (await readline.question(`${question}${suffix}: `)).trim();
+  readline.close();
+  return answer || defaultValue;
 }
 
-function getApiKey(provider, env) {
-  const key = provider.apiKey || (provider.apiKeyEnv ? env[provider.apiKeyEnv] : undefined);
-  if (!key) throw new Error(`${provider.name || provider.type}: missing apiKey or apiKeyEnv`);
-  return key;
+async function askSecret(question, fallback = "") {
+  if (!process.stdin.isTTY) return ask(question, fallback);
+  let muted = false;
+  const output = new Writable({
+    write(chunk, encoding, callback) {
+      if (!muted) process.stdout.write(chunk, encoding);
+      callback();
+    },
+  });
+  const readline = createInterface({ input: process.stdin, output, terminal: true });
+  const hint = fallback ? " [回车使用 .env.local 中的值]" : "";
+  const pending = readline.question(`${question}${hint}: `);
+  muted = true;
+  const answer = (await pending).trim();
+  muted = false;
+  readline.close();
+  process.stdout.write("\n");
+  return answer || fallback;
+}
+
+async function confirm(question, defaultYes = true) {
+  const answer = (await ask(`${question} ${defaultYes ? "[Y/n]" : "[y/N]"}`)).toLowerCase();
+  return answer ? answer === "y" || answer === "yes" : defaultYes;
 }
 
 function deriveBaseURL(endpoint) {
@@ -79,25 +123,19 @@ async function fetchJson(url, options) {
   return response.json();
 }
 
-async function fetchModels(provider, apiKey) {
-  if (Array.isArray(provider.models)) return provider.models;
-
-  const baseURL = deriveBaseURL(provider.endpoint);
-  const modelsEndpoint = provider.modelsEndpoint || appendPath(baseURL, "models");
+async function fetchModels(provider) {
+  const modelsEndpoint = provider.modelsEndpoint || appendPath(deriveBaseURL(provider.endpoint), "models");
 
   if (provider.type === "anthropic") {
     const json = await fetchJson(modelsEndpoint, {
-      headers: {
-        "x-api-key": apiKey,
-        "anthropic-version": provider.anthropicVersion || "2023-06-01",
-      },
+      headers: { "x-api-key": provider.apiKey, "anthropic-version": "2023-06-01" },
     });
     return (json.data || []).map((model) => model.id).filter(Boolean);
   }
 
   if (provider.type === "gemini" && modelsEndpoint.includes("generativelanguage.googleapis.com")) {
     const url = new URL(modelsEndpoint);
-    url.searchParams.set("key", apiKey);
+    url.searchParams.set("key", provider.apiKey);
     const json = await fetchJson(url);
     return (json.models || [])
       .filter((model) => !model.supportedGenerationMethods || model.supportedGenerationMethods.includes("generateContent"))
@@ -106,126 +144,143 @@ async function fetchModels(provider, apiKey) {
   }
 
   const json = await fetchJson(modelsEndpoint, {
-    headers: { Authorization: `Bearer ${apiKey}` },
+    headers: { Authorization: `Bearer ${provider.apiKey}` },
   });
   return (json.data || []).map((model) => model.id).filter(Boolean);
 }
 
-function filterModels(models, provider) {
-  const include = (provider.include || []).map((pattern) => new RegExp(pattern, "i"));
-  const exclude = (provider.exclude || []).map((pattern) => new RegExp(pattern, "i"));
+function filterModels(models, includePattern, excludePatterns) {
+  const include = includePattern ? new RegExp(includePattern, "i") : null;
+  const exclude = excludePatterns.filter(Boolean).map((pattern) => new RegExp(pattern, "i"));
   return [...new Set(models)]
-    .filter((model) => include.length === 0 || include.some((regex) => regex.test(model)))
+    .filter((model) => !include || include.test(model))
     .filter((model) => !exclude.some((regex) => regex.test(model)))
     .sort();
 }
 
+async function promptProvider(env) {
+  console.log("\n选择供应商：\n1) OpenAI\n2) Anthropic\n3) Gemini");
+  const choice = await ask("请输入序号", "1");
+  const type = { 1: "openai", 2: "anthropic", 3: "gemini" }[choice];
+  if (!type) throw new Error("无效的供应商序号");
+
+  const defaults = PROVIDERS[type];
+  const name = await ask("监控名称", defaults.label);
+  const endpoint = await ask("调用端点", defaults.endpoint);
+  const modelsEndpoint = await ask("模型列表端点（留空自动推导）");
+  const apiKey = await askSecret("API Key（输入不显示）", env[defaults.apiKeyEnv]);
+  if (!apiKey) throw new Error("API Key 不能为空");
+  const groupName = await ask("监控分组", defaults.label);
+  const includePattern = await ask("模型包含正则（留空表示全部）", defaults.include);
+  const excludeInput = await ask("排除规则，逗号分隔", defaults.exclude);
+
+  return {
+    name,
+    type,
+    endpoint,
+    modelsEndpoint,
+    apiKey,
+    groupName,
+    includePattern,
+    excludePatterns: excludeInput.split(",").map((value) => value.trim()),
+  };
+}
+
 async function upsertModels(supabase, type, models) {
-  const rows = models.map((model) => ({ type, model }));
   const { data, error } = await supabase
     .from("check_models")
-    .upsert(rows, { onConflict: "type,model" })
-    .select("id,type,model");
+    .upsert(models.map((model) => ({ type, model })), { onConflict: "type,model" })
+    .select("id,model");
   if (error) throw error;
   return new Map(data.map((row) => [row.model, row.id]));
 }
 
-async function loadExistingConfigs(supabase, type, endpoint) {
-  const { data, error } = await supabase
-    .from("check_configs")
-    .select("id,name,type,model_id,endpoint,api_key,enabled,group_name")
-    .eq("type", type)
-    .eq("endpoint", endpoint);
-  if (error) throw error;
-  return new Map(data.map((row) => [row.model_id, row]));
-}
-
-async function syncProvider(supabase, provider, env, dryRun) {
-  const apiKey = getApiKey(provider, env);
-  const endpoint = provider.endpoint;
-  if (!endpoint) throw new Error(`${provider.name || provider.type}: missing endpoint`);
-
-  const models = filterModels(await fetchModels(provider, apiKey), provider);
-  console.log(`${provider.name || provider.type}: ${models.length} model(s)`);
-  if (dryRun || models.length === 0) {
-    for (const model of models) console.log(`  ${model}`);
-    return;
-  }
-
+async function syncProvider(supabase, provider, models) {
   const modelIds = await upsertModels(supabase, provider.type, models);
-  const existing = await loadExistingConfigs(supabase, provider.type, endpoint);
-  const rowsToInsert = [];
+  const { data: existingRows, error } = await supabase
+    .from("check_configs")
+    .select("id,name,model_id,api_key,enabled,group_name")
+    .eq("type", provider.type)
+    .eq("endpoint", provider.endpoint);
+  if (error) throw error;
+
+  const existing = new Map(existingRows.map((row) => [row.model_id, row]));
+  const inserts = [];
+  let updated = 0;
 
   for (const model of models) {
     const modelId = modelIds.get(model);
-    const name = `${provider.name || provider.type} ${model}`;
     const row = {
-      name,
+      name: `${provider.name} ${model}`,
       type: provider.type,
       model_id: modelId,
-      endpoint,
-      api_key: apiKey,
-      enabled: provider.enabled ?? true,
-      group_name: provider.groupName ?? null,
+      endpoint: provider.endpoint,
+      api_key: provider.apiKey,
+      enabled: true,
+      group_name: provider.groupName || null,
     };
     const current = existing.get(modelId);
     if (!current) {
-      rowsToInsert.push(row);
-      continue;
-    }
-    const changed =
+      inserts.push(row);
+    } else if (
       current.name !== row.name ||
       current.api_key !== row.api_key ||
-      current.enabled !== row.enabled ||
-      (current.group_name || null) !== row.group_name;
-    if (changed) {
-      const { error } = await supabase.from("check_configs").update(row).eq("id", current.id);
-      if (error) throw error;
+      !current.enabled ||
+      (current.group_name || null) !== row.group_name
+    ) {
+      const { error: updateError } = await supabase.from("check_configs").update(row).eq("id", current.id);
+      if (updateError) throw updateError;
+      updated += 1;
     }
   }
 
-  if (rowsToInsert.length > 0) {
-    const { error } = await supabase.from("check_configs").insert(rowsToInsert);
-    if (error) throw error;
+  if (inserts.length > 0) {
+    const { error: insertError } = await supabase.from("check_configs").insert(inserts);
+    if (insertError) throw insertError;
   }
-  console.log(`  inserted=${rowsToInsert.length}, existing=${models.length - rowsToInsert.length}`);
+  console.log(`完成：新增 ${inserts.length}，更新 ${updated}，已有 ${models.length - inserts.length - updated}`);
 }
 
 function printHelp() {
-  console.log(`Usage: pnpm models:sync -- [--config ${DEFAULT_CONFIG}] [--schema public|dev] [--dry-run]`);
+  console.log("Usage: pnpm models:sync -- [--schema public|dev] [--dry-run]");
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
-  if (args.help) {
-    printHelp();
-    return;
-  }
+  if (args.help) return printHelp();
+  if (!process.stdin.isTTY) throw new Error("引导模式需要在交互式终端中运行");
 
   const env = loadEnv();
-  const configPath = resolve(process.cwd(), args.config);
-  const config = loadConfig(configPath);
-  const schema = args.schema || config.schema || "public";
+  const schema = args.schema || await ask("Supabase schema", "public");
+  if (!new Set(["public", "dev"]).has(schema)) throw new Error("schema 只能是 public 或 dev");
 
-  const supabaseUrl = env.SUPABASE_URL;
-  const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY;
-  if (!args.dryRun && (!supabaseUrl || !serviceRoleKey)) {
-    throw new Error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in .env.local/.env");
+  let supabase;
+  while (true) {
+    const provider = await promptProvider(env);
+    console.log("\n正在获取模型列表...");
+    const models = filterModels(await fetchModels(provider), provider.includePattern, provider.excludePatterns);
+    if (models.length === 0) throw new Error("筛选后没有可监控模型，请调整包含或排除规则");
+
+    console.log(`\n找到 ${models.length} 个模型：`);
+    for (const model of models) console.log(`- ${model}`);
+    if (!await confirm(args.dryRun ? "结束预览？" : "确认写入监控站？")) continue;
+
+    if (!args.dryRun) {
+      const supabaseUrl = env.SUPABASE_URL || await ask("SUPABASE_URL");
+      const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY || await askSecret("SUPABASE_SERVICE_ROLE_KEY（输入不显示）");
+      if (!supabaseUrl || !serviceRoleKey) throw new Error("Supabase URL 和 Service Role Key 不能为空");
+      if (!supabase) {
+        const { createClient } = await import("@supabase/supabase-js");
+        supabase = createClient(supabaseUrl, serviceRoleKey, { db: { schema } });
+      }
+      await syncProvider(supabase, provider, models);
+    }
+
+    if (!await confirm("继续添加其他供应商？", false)) break;
   }
-
-  const supabase = args.dryRun
-    ? null
-    : createClientFrom(await import("@supabase/supabase-js"), supabaseUrl, serviceRoleKey, schema);
-  for (const provider of config.providers || []) {
-    await syncProvider(supabase, provider, env, args.dryRun);
-  }
-}
-
-function createClientFrom(module, supabaseUrl, serviceRoleKey, schema) {
-  return module.createClient(supabaseUrl, serviceRoleKey, { db: { schema } });
 }
 
 main().catch((error) => {
-  console.error(error.message || error);
+  console.error(`\n失败：${error.message || error}`);
   process.exit(1);
 });
