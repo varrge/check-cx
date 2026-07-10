@@ -6,21 +6,30 @@ import { createInterface } from "node:readline/promises";
 const PROVIDERS = {
   openai: {
     label: "OpenAI",
-    endpoint: "https://api.openai.com/v1/chat/completions",
+    serviceUrl: "https://api.openai.com",
+    apiVersion: "v1",
+    callPath: "chat/completions",
+    callSuffix: /\/(chat\/completions|responses)$/i,
     apiKeyEnv: "OPENAI_API_KEY",
     include: "^(gpt|o[0-9])",
-    exclude: "embedding,audio,tts,whisper,moderation",
+    exclude: "embedding,audio,tts,whisper,moderation,image",
   },
   anthropic: {
     label: "Anthropic",
-    endpoint: "https://api.anthropic.com/v1/messages",
+    serviceUrl: "https://api.anthropic.com",
+    apiVersion: "v1",
+    callPath: "messages",
+    callSuffix: /\/messages$/i,
     apiKeyEnv: "ANTHROPIC_API_KEY",
     include: "^claude",
     exclude: "",
   },
   gemini: {
     label: "Gemini",
-    endpoint: "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent",
+    serviceUrl: "https://generativelanguage.googleapis.com",
+    apiVersion: "v1beta",
+    callPath: "models/gemini-2.0-flash:generateContent",
+    callSuffix: /\/models\/[^/:]+:(generateContent|streamGenerateContent)$/i,
     apiKeyEnv: "GEMINI_API_KEY",
     include: "^gemini",
     exclude: "embedding",
@@ -31,11 +40,12 @@ const API_PATH_SUFFIX_REGEX = /\/(chat\/completions|responses|messages)\/?$/;
 const GOOGLE_GENERATIVE_API_REGEX = /\/v\d+\w*\/models\/[^/:]+:(generateContent|streamGenerateContent)\/?$/;
 
 function parseArgs(argv) {
-  const args = { dryRun: false };
+  const args = { dryRun: false, selfTest: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--dry-run") args.dryRun = true;
     else if (arg === "--schema") args.schema = argv[++index];
+    else if (arg === "--self-test") args.selfTest = true;
     else if (arg === "--help") args.help = true;
     else throw new Error(`Unknown argument: ${arg}`);
   }
@@ -114,6 +124,63 @@ function appendPath(base, path) {
   return `${base.replace(/\/$/, "")}/${path.replace(/^\//, "")}`;
 }
 
+function inferProviderEndpoints(type, input) {
+  const defaults = PROVIDERS[type];
+  const serviceUrl = /^[a-z][a-z\d+.-]*:\/\//i.test(input.trim()) ? input.trim() : `https://${input.trim()}`;
+  const url = new URL(serviceUrl);
+  if (!new Set(["http:", "https:"]).has(url.protocol)) throw new Error("服务地址只支持 http:// 或 https://");
+
+  url.hash = "";
+  const inputPath = url.pathname.replace(/\/+$/, "");
+  url.pathname = inputPath || "/";
+  const modelsSuffix = /\/models$/i;
+  let apiPath;
+  let endpoint;
+  let modelsEndpoint;
+
+  if (defaults.callSuffix.test(inputPath)) {
+    apiPath = inputPath.replace(defaults.callSuffix, "");
+    endpoint = url.toString();
+  } else if (modelsSuffix.test(inputPath)) {
+    apiPath = inputPath.replace(modelsSuffix, "");
+    modelsEndpoint = url.toString();
+  } else {
+    apiPath = /\/v\d+[a-z\d]*$/i.test(inputPath)
+      ? inputPath
+      : `${inputPath}/${defaults.apiVersion}`;
+  }
+
+  function buildEndpoint(path) {
+    const result = new URL(url);
+    result.pathname = `${apiPath.replace(/\/$/, "")}/${path.replace(/^\//, "")}`;
+    return result.toString();
+  }
+
+  return {
+    endpoint: endpoint || buildEndpoint(defaults.callPath),
+    modelsEndpoint: modelsEndpoint || buildEndpoint("models"),
+  };
+}
+
+function runEndpointSelfTest() {
+  const cases = [
+    ["openai", "https://gateway.example.com", "https://gateway.example.com/v1/chat/completions", "https://gateway.example.com/v1/models"],
+    ["openai", "gateway.example.com/v1", "https://gateway.example.com/v1/chat/completions", "https://gateway.example.com/v1/models"],
+    ["openai", "https://gateway.example.com/v1/models", "https://gateway.example.com/v1/chat/completions", "https://gateway.example.com/v1/models"],
+    ["openai", "https://gateway.example.com/v1/responses", "https://gateway.example.com/v1/responses", "https://gateway.example.com/v1/models"],
+    ["anthropic", "https://api.anthropic.com", "https://api.anthropic.com/v1/messages", "https://api.anthropic.com/v1/models"],
+    ["gemini", "https://generativelanguage.googleapis.com", "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent", "https://generativelanguage.googleapis.com/v1beta/models"],
+  ];
+
+  for (const [type, input, expectedEndpoint, expectedModelsEndpoint] of cases) {
+    const actual = inferProviderEndpoints(type, input);
+    if (actual.endpoint !== expectedEndpoint || actual.modelsEndpoint !== expectedModelsEndpoint) {
+      throw new Error(`${type} 端点推导失败：${input} -> ${JSON.stringify(actual)}`);
+    }
+  }
+  console.log(`端点推导自检通过（${cases.length} 个场景）`);
+}
+
 async function fetchJson(url, options) {
   const response = await fetch(url, options);
   const body = await response.text();
@@ -127,6 +194,34 @@ async function fetchJson(url, options) {
     const contentType = response.headers.get("content-type") || "unknown";
     throw new Error(`${url} 没有返回 JSON，content-type=${contentType}: ${body.slice(0, 300)}`);
   }
+}
+
+function createSupabaseRestClient(supabaseUrl, serviceRoleKey, schema) {
+  const restUrl = appendPath(supabaseUrl, "rest/v1");
+  const baseHeaders = {
+    apikey: serviceRoleKey,
+    Authorization: `Bearer ${serviceRoleKey}`,
+    "Content-Type": "application/json",
+    "Accept-Profile": schema,
+    "Content-Profile": schema,
+  };
+
+  async function request(path, options = {}) {
+    const response = await fetch(`${restUrl}/${path}`, {
+      ...options,
+      headers: {
+        ...baseHeaders,
+        ...(options.headers || {}),
+      },
+    });
+    const body = await response.text();
+    if (!response.ok) {
+      throw new Error(`Supabase ${path} 返回 ${response.status}: ${body.slice(0, 300)}`);
+    }
+    return body ? JSON.parse(body) : null;
+  }
+
+  return { request };
 }
 
 async function fetchModels(provider) {
@@ -183,16 +278,20 @@ async function fetchOrPromptModels(provider) {
 }
 
 async function promptProvider(env) {
-  console.log("\n选择供应商：\n1) OpenAI\n2) Anthropic\n3) Gemini");
+  console.log("\n选择供应商：\n1) OpenAI / OpenAI 兼容接口\n2) Anthropic\n3) Gemini");
   const choice = await ask("请输入序号", "1");
   const type = { 1: "openai", 2: "anthropic", 3: "gemini" }[choice];
   if (!type) throw new Error("无效的供应商序号");
 
   const defaults = PROVIDERS[type];
   const name = await ask("监控名称", defaults.label);
-  const endpoint = await ask("调用端点", defaults.endpoint);
-  const inferredModelsEndpoint = appendPath(deriveBaseURL(endpoint), "models");
-  const modelsEndpoint = await ask("模型列表端点", inferredModelsEndpoint);
+  const serviceUrl = await ask("服务地址（域名、/v1 地址或任一完整端点）", defaults.serviceUrl);
+  let { endpoint, modelsEndpoint } = inferProviderEndpoints(type, serviceUrl);
+  console.log(`\n已自动推导：\n- 调用端点：${endpoint}\n- 模型列表：${modelsEndpoint}`);
+  if (!await confirm("使用以上端点？", true)) {
+    endpoint = await ask("调用端点", endpoint);
+    modelsEndpoint = await ask("模型列表端点", modelsEndpoint);
+  }
   const apiKey = await askSecret("API Key（输入不显示）", env[defaults.apiKeyEnv]);
   if (!apiKey) throw new Error("API Key 不能为空");
   const groupName = await ask("监控分组", defaults.label);
@@ -212,22 +311,22 @@ async function promptProvider(env) {
 }
 
 async function upsertModels(supabase, type, models) {
-  const { data, error } = await supabase
-    .from("check_models")
-    .upsert(models.map((model) => ({ type, model })), { onConflict: "type,model" })
-    .select("id,model");
-  if (error) throw error;
-  return new Map(data.map((row) => [row.model, row.id]));
+  const rows = await supabase.request("check_models?on_conflict=type,model&select=id,model", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: JSON.stringify(models.map((model) => ({ type, model }))),
+  });
+  return new Map(rows.map((row) => [row.model, row.id]));
 }
 
 async function syncProvider(supabase, provider, models) {
   const modelIds = await upsertModels(supabase, provider.type, models);
-  const { data: existingRows, error } = await supabase
-    .from("check_configs")
-    .select("id,name,model_id,api_key,enabled,group_name")
-    .eq("type", provider.type)
-    .eq("endpoint", provider.endpoint);
-  if (error) throw error;
+  const params = new URLSearchParams({
+    select: "id,name,model_id,api_key,enabled,group_name",
+    type: `eq.${provider.type}`,
+    endpoint: `eq.${provider.endpoint}`,
+  });
+  const existingRows = await supabase.request(`check_configs?${params}`);
 
   const existing = new Map(existingRows.map((row) => [row.model_id, row]));
   const inserts = [];
@@ -253,26 +352,33 @@ async function syncProvider(supabase, provider, models) {
       !current.enabled ||
       (current.group_name || null) !== row.group_name
     ) {
-      const { error: updateError } = await supabase.from("check_configs").update(row).eq("id", current.id);
-      if (updateError) throw updateError;
+      await supabase.request(`check_configs?id=eq.${current.id}`, {
+        method: "PATCH",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify(row),
+      });
       updated += 1;
     }
   }
 
   if (inserts.length > 0) {
-    const { error: insertError } = await supabase.from("check_configs").insert(inserts);
-    if (insertError) throw insertError;
+    await supabase.request("check_configs", {
+      method: "POST",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify(inserts),
+    });
   }
   console.log(`完成：新增 ${inserts.length}，更新 ${updated}，已有 ${models.length - inserts.length - updated}`);
 }
 
 function printHelp() {
-  console.log("Usage: pnpm models:sync -- [--schema public|dev] [--dry-run]");
+  console.log("Usage: pnpm models:sync -- [--schema public|dev] [--dry-run] [--self-test]");
 }
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) return printHelp();
+  if (args.selfTest) return runEndpointSelfTest();
   if (!process.stdin.isTTY) throw new Error("引导模式需要在交互式终端中运行");
 
   const env = loadEnv();
@@ -295,8 +401,7 @@ async function main() {
       const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY || await askSecret("SUPABASE_SERVICE_ROLE_KEY（输入不显示）");
       if (!supabaseUrl || !serviceRoleKey) throw new Error("Supabase URL 和 Service Role Key 不能为空");
       if (!supabase) {
-        const { createClient } = await import("@supabase/supabase-js");
-        supabase = createClient(supabaseUrl, serviceRoleKey, { db: { schema } });
+        supabase = createSupabaseRestClient(supabaseUrl, serviceRoleKey, schema);
       }
       await syncProvider(supabase, provider, models);
     }
