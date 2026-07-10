@@ -116,11 +116,17 @@ function appendPath(base, path) {
 
 async function fetchJson(url, options) {
   const response = await fetch(url, options);
+  const body = await response.text();
   if (!response.ok) {
-    const body = await response.text();
-    throw new Error(`${response.status} ${response.statusText}: ${body.slice(0, 300)}`);
+    throw new Error(`${url} 返回 ${response.status} ${response.statusText}: ${body.slice(0, 300)}`);
   }
-  return response.json();
+
+  try {
+    return JSON.parse(body);
+  } catch {
+    const contentType = response.headers.get("content-type") || "unknown";
+    throw new Error(`${url} 没有返回 JSON，content-type=${contentType}: ${body.slice(0, 300)}`);
+  }
 }
 
 async function fetchModels(provider) {
@@ -158,6 +164,24 @@ function filterModels(models, includePattern, excludePatterns) {
     .sort();
 }
 
+async function fetchOrPromptModels(provider) {
+  try {
+    return filterModels(await fetchModels(provider), provider.includePattern, provider.excludePatterns);
+  } catch (error) {
+    console.error(`\n自动获取模型列表失败：${error.message || error}`);
+    if (!await confirm("是否手动输入模型名继续？", true)) {
+      throw error;
+    }
+    const input = await ask("模型名，多个用逗号分隔");
+    const models = input
+      .split(",")
+      .map((model) => model.trim())
+      .filter(Boolean);
+    if (models.length === 0) throw new Error("没有输入任何模型名");
+    return [...new Set(models)].sort();
+  }
+}
+
 async function promptProvider(env) {
   console.log("\n选择供应商：\n1) OpenAI\n2) Anthropic\n3) Gemini");
   const choice = await ask("请输入序号", "1");
@@ -167,7 +191,8 @@ async function promptProvider(env) {
   const defaults = PROVIDERS[type];
   const name = await ask("监控名称", defaults.label);
   const endpoint = await ask("调用端点", defaults.endpoint);
-  const modelsEndpoint = await ask("模型列表端点（留空自动推导）");
+  const inferredModelsEndpoint = appendPath(deriveBaseURL(endpoint), "models");
+  const modelsEndpoint = await ask("模型列表端点", inferredModelsEndpoint);
   const apiKey = await askSecret("API Key（输入不显示）", env[defaults.apiKeyEnv]);
   if (!apiKey) throw new Error("API Key 不能为空");
   const groupName = await ask("监控分组", defaults.label);
@@ -258,7 +283,7 @@ async function main() {
   while (true) {
     const provider = await promptProvider(env);
     console.log("\n正在获取模型列表...");
-    const models = filterModels(await fetchModels(provider), provider.includePattern, provider.excludePatterns);
+    const models = await fetchOrPromptModels(provider);
     if (models.length === 0) throw new Error("筛选后没有可监控模型，请调整包含或排除规则");
 
     console.log(`\n找到 ${models.length} 个模型：`);
