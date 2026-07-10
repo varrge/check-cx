@@ -6,6 +6,7 @@
     "dev": "node scripts/dev.mjs",
     "build": "next build",
     "start": "next start",
+    "models:remove": "node scripts/sync-provider-models.mjs --remove",
     "models:sync": "node scripts/sync-provider-models.mjs",
     "lint": "eslint"
   },

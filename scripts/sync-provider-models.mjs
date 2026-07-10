@@ -40,10 +40,11 @@ const API_PATH_SUFFIX_REGEX = /\/(chat\/completions|responses|messages)\/?$/;
 const GOOGLE_GENERATIVE_API_REGEX = /\/v\d+\w*\/models\/[^/:]+:(generateContent|streamGenerateContent)\/?$/;
 
 function parseArgs(argv) {
-  const args = { dryRun: false, selfTest: false };
+  const args = { dryRun: false, remove: false, selfTest: false };
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--dry-run") args.dryRun = true;
+    else if (arg === "--remove") args.remove = true;
     else if (arg === "--schema") args.schema = argv[++index];
     else if (arg === "--self-test") args.selfTest = true;
     else if (arg === "--help") args.help = true;
@@ -178,7 +179,13 @@ function runEndpointSelfTest() {
       throw new Error(`${type} 端点推导失败：${input} -> ${JSON.stringify(actual)}`);
     }
   }
-  console.log(`端点推导自检通过（${cases.length} 个场景）`);
+
+  const selectionCases = [["1", 3, 0], ["3", 3, 2], ["0", 3, -1], ["4", 3, -1], ["1.5", 3, -1]];
+  for (const [input, count, expected] of selectionCases) {
+    const actual = parseSelection(input, count);
+    if (actual !== expected) throw new Error(`删除序号解析失败：${input} -> ${actual}`);
+  }
+  console.log(`脚本自检通过（${cases.length} 个端点场景，${selectionCases.length} 个删除选择场景）`);
 }
 
 async function fetchJson(url, options) {
@@ -371,8 +378,77 @@ async function syncProvider(supabase, provider, models) {
   console.log(`完成：新增 ${inserts.length}，更新 ${updated}，已有 ${models.length - inserts.length - updated}`);
 }
 
+function getModelName(config) {
+  const relation = Array.isArray(config.check_models) ? config.check_models[0] : config.check_models;
+  return relation?.model || "未知模型";
+}
+
+function parseSelection(input, count) {
+  if (!/^\d+$/.test(input)) return -1;
+  const index = Number(input) - 1;
+  return index >= 0 && index < count ? index : -1;
+}
+
+async function removeMonitoredModel(supabase, dryRun) {
+  const params = new URLSearchParams({
+    select: "id,name,type,endpoint,enabled,group_name,check_models(model)",
+    order: "group_name.asc.nullslast,name.asc",
+  });
+  const configs = await supabase.request(`check_configs?${params}`);
+  if (configs.length === 0) {
+    console.log("当前没有可删除的模型监控配置");
+    return;
+  }
+
+  console.log(`\n当前共有 ${configs.length} 个模型监控配置：`);
+  configs.forEach((config, index) => {
+    const group = config.group_name || "未分组";
+    const status = config.enabled ? "启用" : "停用";
+    console.log(`${index + 1}) [${group}] ${getModelName(config)} | ${config.name} | ${config.type} | ${status}`);
+  });
+
+  let selected;
+  while (!selected) {
+    const answer = await ask("输入要删除的序号（q 取消）");
+    if (answer.toLowerCase() === "q") {
+      console.log("已取消，没有删除任何配置");
+      return;
+    }
+    const selectedIndex = parseSelection(answer, configs.length);
+    if (selectedIndex >= 0) {
+      selected = configs[selectedIndex];
+    } else {
+      console.log(`请输入 1-${configs.length} 之间的序号，或输入 q 取消`);
+    }
+  }
+
+  const displayEndpoint = selected.endpoint.split("?")[0] + (selected.endpoint.includes("?") ? "?…" : "");
+  console.log(`\n即将删除：\n- 模型：${getModelName(selected)}\n- 名称：${selected.name}\n- 分组：${selected.group_name || "未分组"}\n- 端点：${displayEndpoint}`);
+  console.log("注意：对应的检测历史会一并删除；共享模型定义和其他监控配置不会受影响。");
+
+  if (dryRun) {
+    console.log("\n预览完成，--dry-run 模式没有执行删除");
+    return;
+  }
+  if (!await confirm("确认永久删除这个监控配置？", false)) {
+    console.log("已取消，没有删除任何配置");
+    return;
+  }
+
+  const deleted = await supabase.request(`check_configs?id=eq.${selected.id}`, {
+    method: "DELETE",
+    headers: { Prefer: "return=representation" },
+  });
+  if (!Array.isArray(deleted) || deleted.length !== 1) {
+    throw new Error("删除结果异常，请刷新列表后重试");
+  }
+  console.log(`删除完成：${getModelName(selected)}（${selected.name}）`);
+}
+
 function printHelp() {
-  console.log("Usage: pnpm models:sync -- [--schema public|dev] [--dry-run] [--self-test]");
+  console.log("Usage:");
+  console.log("  pnpm models:sync -- [--schema public|dev] [--dry-run] [--self-test]");
+  console.log("  pnpm models:remove -- [--schema public|dev] [--dry-run]");
 }
 
 async function main() {
@@ -384,6 +460,14 @@ async function main() {
   const env = loadEnv();
   const schema = args.schema || await ask("Supabase schema", "public");
   if (!new Set(["public", "dev"]).has(schema)) throw new Error("schema 只能是 public 或 dev");
+
+  if (args.remove) {
+    const supabaseUrl = env.SUPABASE_URL || await ask("SUPABASE_URL");
+    const serviceRoleKey = env.SUPABASE_SERVICE_ROLE_KEY || await askSecret("SUPABASE_SERVICE_ROLE_KEY（输入不显示）");
+    if (!supabaseUrl || !serviceRoleKey) throw new Error("Supabase URL 和 Service Role Key 不能为空");
+    const supabase = createSupabaseRestClient(supabaseUrl, serviceRoleKey, schema);
+    return removeMonitoredModel(supabase, args.dryRun);
+  }
 
   let supabase;
   while (true) {
