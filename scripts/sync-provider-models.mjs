@@ -180,10 +180,24 @@ function runEndpointSelfTest() {
     }
   }
 
-  const selectionCases = [["1", 3, 0], ["3", 3, 2], ["0", 3, -1], ["4", 3, -1], ["1.5", 3, -1]];
+  const selectionCases = [
+    ["1", 5, [0]],
+    ["1,3,5", 5, [0, 2, 4]],
+    ["1 3 5", 5, [0, 2, 4]],
+    ["2-4", 5, [1, 2, 3]],
+    ["1,3-5,3", 5, [0, 2, 3, 4]],
+    ["all", 3, [0, 1, 2]],
+    ["全部", 3, [0, 1, 2]],
+    ["0", 3, null],
+    ["4", 3, null],
+    ["3-1", 3, null],
+    ["1.5", 3, null],
+  ];
   for (const [input, count, expected] of selectionCases) {
-    const actual = parseSelection(input, count);
-    if (actual !== expected) throw new Error(`删除序号解析失败：${input} -> ${actual}`);
+    const actual = parseSelections(input, count);
+    if (JSON.stringify(actual) !== JSON.stringify(expected)) {
+      throw new Error(`删除序号解析失败：${input} -> ${JSON.stringify(actual)}`);
+    }
   }
   console.log(`脚本自检通过（${cases.length} 个端点场景，${selectionCases.length} 个删除选择场景）`);
 }
@@ -383,10 +397,25 @@ function getModelName(config) {
   return relation?.model || "未知模型";
 }
 
-function parseSelection(input, count) {
-  if (!/^\d+$/.test(input)) return -1;
-  const index = Number(input) - 1;
-  return index >= 0 && index < count ? index : -1;
+function parseSelections(input, count) {
+  const normalized = input.trim().toLowerCase();
+  if (normalized === "all" || normalized === "全部") {
+    return Array.from({ length: count }, (_, index) => index);
+  }
+
+  const indexes = new Set();
+  const parts = normalized.split(/[,，\s]+/).filter(Boolean);
+  if (parts.length === 0) return null;
+
+  for (const part of parts) {
+    const match = part.match(/^(\d+)(?:-(\d+))?$/);
+    if (!match) return null;
+    const start = Number(match[1]);
+    const end = Number(match[2] || match[1]);
+    if (start < 1 || end < start || end > count) return null;
+    for (let number = start; number <= end; number += 1) indexes.add(number - 1);
+  }
+  return [...indexes].sort((left, right) => left - right);
 }
 
 async function removeMonitoredModel(supabase, dryRun) {
@@ -407,42 +436,46 @@ async function removeMonitoredModel(supabase, dryRun) {
     console.log(`${index + 1}) [${group}] ${getModelName(config)} | ${config.name} | ${config.type} | ${status}`);
   });
 
-  let selected;
-  while (!selected) {
-    const answer = await ask("输入要删除的序号（q 取消）");
+  let selected = [];
+  while (selected.length === 0) {
+    const answer = await ask("输入序号（如 1,3,5-8；all 全选；q 取消）");
     if (answer.toLowerCase() === "q") {
       console.log("已取消，没有删除任何配置");
       return;
     }
-    const selectedIndex = parseSelection(answer, configs.length);
-    if (selectedIndex >= 0) {
-      selected = configs[selectedIndex];
+    const selectedIndexes = parseSelections(answer, configs.length);
+    if (selectedIndexes) {
+      selected = selectedIndexes.map((index) => configs[index]);
     } else {
-      console.log(`请输入 1-${configs.length} 之间的序号，或输入 q 取消`);
+      console.log(`请输入 1-${configs.length} 的序号、范围或 all，也可输入 q 取消`);
     }
   }
 
-  const displayEndpoint = selected.endpoint.split("?")[0] + (selected.endpoint.includes("?") ? "?…" : "");
-  console.log(`\n即将删除：\n- 模型：${getModelName(selected)}\n- 名称：${selected.name}\n- 分组：${selected.group_name || "未分组"}\n- 端点：${displayEndpoint}`);
+  console.log(`\n即将删除 ${selected.length} 个模型监控配置：`);
+  selected.forEach((config) => {
+    const displayEndpoint = config.endpoint.split("?")[0] + (config.endpoint.includes("?") ? "?…" : "");
+    console.log(`- [${config.group_name || "未分组"}] ${getModelName(config)} | ${config.name} | ${displayEndpoint}`);
+  });
   console.log("注意：对应的检测历史会一并删除；共享模型定义和其他监控配置不会受影响。");
 
   if (dryRun) {
     console.log("\n预览完成，--dry-run 模式没有执行删除");
     return;
   }
-  if (!await confirm("确认永久删除这个监控配置？", false)) {
+  if (!await confirm(`确认永久删除这 ${selected.length} 个监控配置？`, false)) {
     console.log("已取消，没有删除任何配置");
     return;
   }
 
-  const deleted = await supabase.request(`check_configs?id=eq.${selected.id}`, {
+  const ids = selected.map((config) => config.id).join(",");
+  const deleted = await supabase.request(`check_configs?id=in.(${ids})`, {
     method: "DELETE",
     headers: { Prefer: "return=representation" },
   });
-  if (!Array.isArray(deleted) || deleted.length !== 1) {
+  if (!Array.isArray(deleted) || deleted.length !== selected.length) {
     throw new Error("删除结果异常，请刷新列表后重试");
   }
-  console.log(`删除完成：${getModelName(selected)}（${selected.name}）`);
+  console.log(`删除完成：共删除 ${deleted.length} 个模型监控配置`);
 }
 
 function printHelp() {
